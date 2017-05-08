@@ -25,8 +25,8 @@ parser.add_argument('--nz', type=int, default=100, help='size of the latent z ve
 parser.add_argument('--ngf', type=int, default=64)
 parser.add_argument('--ndf', type=int, default=64)
 parser.add_argument('--niter', type=int, default=25, help='number of epochs to train for')
-parser.add_argument('--lrD', type=float, default=1e-4, help='learning rate for Critic, default=0.00005')
-parser.add_argument('--lrG', type=float, default=1e-4, help='learning rate for Generator, default=0.00005')
+parser.add_argument('--lrD', type=float, default=0.00005, help='learning rate for Critic, default=0.00005')
+parser.add_argument('--lrG', type=float, default=0.00005, help='learning rate for Generator, default=0.00005')
 parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
 parser.add_argument('--beta2', type=float, default=0.9, help='beta2 for adam. default=0.9')
 parser.add_argument('--cuda'  , action='store_true', help='enables cuda')
@@ -166,71 +166,88 @@ class D(nn.Module):
         x = self.fc(x)
 
 
-        return x.mean(0).view(1)
+        return x
 
 nz = 128
-dim = 128
+dim = 64
+penalty_weight = 10
+
 netG = G(nz, dim, (3,opt.imageSize,opt.imageSize))
 netD = D(nz, dim, (3,opt.imageSize,opt.imageSize))
-noise = torch.FloatTensor(opt.batchSize, nz, 1, 1)
+noise       = torch.FloatTensor(opt.batchSize, nz)
+fixed_noise = torch.FloatTensor(opt.batchSize, nz).normal_(0, 1)
+
 
 alpha = torch.FloatTensor(opt.batchSize,1,1,1).uniform_(0,1)
 
 input = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize)
 
+one = torch.FloatTensor([1])
+mone = one * -1
+
 if opt.cuda:
     input = input.cuda()
     netD.cuda()
     netG.cuda()
-    noise = noise.cuda()
+    noise, fixed_noise = noise.cuda(), fixed_noise.cuda()
     alpha = alpha.cuda()
+    one, mone = one.cuda(), mone.cuda()
 
-
+fixed_noise = Variable(fixed_noise, volatile=True)
 optimizerD = optim.Adam(netD.parameters(), lr=opt.lrD, betas=(opt.beta1, opt.beta2))
 optimizerG = optim.Adam(netG.parameters(), lr=opt.lrG, betas=(opt.beta1, opt.beta2))
 
-for i, data in enumerate(dataloader):
 
-    netD.zero_grad()
+gen_iterations = 0
+while True:
+    for i, data in enumerate(dataloader):
+        netD.zero_grad()
 
-    noise.resize_(opt.batchSize, nz).normal_(0, 1)
-    noisev = Variable(noise)
+        noise.resize_(opt.batchSize, nz).normal_(0, 1)
+        noisev = Variable(noise)
 
-    images, _ = data
-    images = images.cuda()
-    input.resize_as_(images).copy_(images)
+        images, _ = data
+        images = images.cuda()
+        input.resize_as_(images).copy_(images)
 
-    real_data = Variable(input)
-    fake_data = netG(noisev)
-
-    D_real    = netD(real_data)
-    D_fake    = netD(fake_data.detach())
-
-    alpha.uniform_(0, 1)
-    #differences = fake_data - real_data
-    alpha_ex = alpha.expand(opt.batchSize, real_data.size(1), real_data.size(2), real_data.size(3))
-    interpolates = (alpha_ex * real_data.data) + (( 1 - alpha_ex ) * fake_data.data)
-
-    sample = Variable(interpolates, requires_grad=True)
-    output = netD(sample)
-    torch.autograd.backward(output, create_graph=True)
-
-    gradients = sample.grad.view(opt.batchSize,-1)
-    slopes = torch.sum(gradients ** 2, 1).sqrt()
-    gradient_penalty = (torch.mean(slopes - 1.) ** 2)
-    gradient_penalty.backward()
+        real_data = Variable(input)
+        fake_data = netG(noisev)
 
 
-    D_loss = D_fake - D_real + 10 * gradient_penalty
+        D_real_vec = netD(real_data)
+        D_real     = D_real_vec.mean(0).view(1)
+        D_real.backward(one, retain_variables=True)
+        D_fake_vec = netD(fake_data.detach())
+        D_fake     = D_fake_vec.mean(0).view(1)
+        D_fake.backward(mone, retain_variables=True)
 
-    D_loss.backward()
-    optimizerD.step()
+        dist = ((real_data-fake_data.detach())**2).view(opt.batchSize, -1).sum(1)**0.5
 
-    netG.zero_grad()
-    D_fake    = netD(fake_data)
-    G_loss    = -D_fake
-    G_loss.backward()
-    optimizerG.step()
+        lip_est = (D_real_vec-D_fake_vec).abs()/(dist+1e-8)
+        lip_loss = penalty_weight*((1.0-lip_est)**2).mean(0).view(1)
+        lip_loss.backward(one)
 
-    print('[%d/%d]Loss_D: %f Loss_G: %f' % (i, len(dataloader), D_loss.data[0], G_loss.data[0]))
+
+        D_loss = D_real - D_fake + lip_loss
+        optimizerD.step()
+
+        if gen_iterations < 25 or gen_iterations % 500 == 0:
+            Diters = 100
+        else:
+            Diters = opt.Diters
+
+        if i % Diters == 0:
+            netG.zero_grad()
+            G_loss = netD(fake_data).mean(0).view(1)
+            G_loss.backward(mone)
+            optimizerG.step()
+            gen_iterations += 1
+
+        if i % 100 == 0:
+            print('[%d/%d][%d] Loss_D: %f Loss_G: %f' % (i, len(dataloader), gen_iterations, D_loss.data[0], G_loss.data[0]))
+
+        if gen_iterations % 100 == 0:
+            vutils.save_image(real_data.data, '{0}/real_samples.png'.format(opt.experiment), normalize=True,range=(-1,1))
+            fake = netG(fixed_noise)
+            vutils.save_image(fake.data, '{0}/fake_samples_{1}.png'.format(opt.experiment, gen_iterations), normalize=True,range=(-1,1))
 
