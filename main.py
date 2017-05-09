@@ -10,7 +10,7 @@ import torch.utils.data
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
-from torch.autograd import Variable
+from torch.autograd import Variable, grad
 import numpy as np
 import os
 
@@ -211,15 +211,11 @@ for i, data in enumerate(dataloader):
     alpha_ex = alpha.expand(opt.batchSize, real_data.size(1), real_data.size(2), real_data.size(3))
     interpolates = (alpha_ex * real_data.data) + (( 1 - alpha_ex ) * fake_data.data)
 
-    sample = Variable(interpolates, requires_grad=True)
-    output = netD(sample)
-    torch.autograd.backward(output, create_graph=True)
-
-    gradients = sample.grad.view(opt.batchSize,-1)
+    interpolates = Variable(interpolates, requires_grad=True)
+    D_interpolates = netD(interpolates)
+    gradients = grad(D_interpolates, interpolates,create_graph=True)[0]
     slopes = torch.sum(gradients ** 2, 1).sqrt()
     gradient_penalty = (torch.mean(slopes - 1.) ** 2)
-    gradient_penalty.backward()
-
 
     D_loss = D_fake - D_real + 10 * gradient_penalty
 
